@@ -7,6 +7,8 @@ with LiteLLM proxy for both request-side and response-side content checking.
 Environment Variables:
     QUILR_GUARDRAILS_KEY: API key for Quilr guardrails (required)
     QUILR_GUARDRAILS_BASE_URL: Base URL for Quilr guardrails API (default: https://guardrails.quilr.ai)
+    APPLY_QUILR_GUARDRAILS_FOR_MODELS: Comma-separated list of models to apply guardrails to (optional, if not set applies to all)
+    APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES: Comma-separated list of API key names to apply guardrails to (optional, if not set applies to all)
 
 Usage in LiteLLM config.yaml:
 
@@ -72,6 +74,13 @@ class QuilrGuardrail(CustomGuardrail):
         self.api_key = os.getenv("QUILR_GUARDRAILS_KEY")
         self.api_base = os.getenv("QUILR_GUARDRAILS_BASE_URL", "https://guardrails.quilr.ai")
 
+        # Parse optional filters (comma-separated lists)
+        models_env = os.getenv("APPLY_QUILR_GUARDRAILS_FOR_MODELS", "")
+        self.allowed_models = [m.strip() for m in models_env.split(",") if m.strip()] or None
+
+        key_names_env = os.getenv("APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES", "")
+        self.allowed_key_names = [k.strip() for k in key_names_env.split(",") if k.strip()] or None
+
         if not self.api_key:
             verbose_proxy_logger.warning(
                 "QUILR_GUARDRAILS_KEY not set. Quilr guardrail will not function."
@@ -100,12 +109,6 @@ class QuilrGuardrail(CustomGuardrail):
 
         endpoint = f"{self.api_base.rstrip('/')}/sdk/v1/check"
 
-        verbose_proxy_logger.debug(
-            "Quilr guardrail: calling %s with payload keys: %s",
-            endpoint,
-            list(payload.keys())
-        )
-
         response = await async_client.post(
             endpoint,
             headers=headers,
@@ -121,6 +124,40 @@ class QuilrGuardrail(CustomGuardrail):
         if categories:
             return f"Content blocked by Quilr: {', '.join(categories)} detected"
         return "Content blocked by Quilr"
+
+    def _should_apply_guardrail(
+        self, model: Optional[str], user_api_key_dict: UserAPIKeyAuth
+    ) -> bool:
+        """
+        Check if guardrail should be applied based on filters.
+
+        Returns True if:
+        - No filters are configured (apply to all), OR
+        - Request matches ALL configured filters (AND logic)
+
+        Args:
+            model: The model being called
+            user_api_key_dict: API key authentication info
+
+        Returns:
+            True if guardrail should be applied, False to skip
+        """
+        # If no filters configured, apply to all
+        if not self.allowed_models and not self.allowed_key_names:
+            return True
+
+        # Check model filter
+        if self.allowed_models:
+            if not model or model not in self.allowed_models:
+                return False
+
+        # Check key name filter
+        if self.allowed_key_names:
+            key_name = user_api_key_dict.key_name
+            if not key_name or key_name not in self.allowed_key_names:
+                return False
+
+        return True
 
     async def async_pre_call_hook(
         self,
@@ -145,8 +182,14 @@ class QuilrGuardrail(CustomGuardrail):
         - If redacted: replaces messages with redacted version
         - If safe: passes through unchanged
         """
+        verbose_proxy_logger.info("Quilr pre-call: request received")
+
         if not self.api_key:
-            verbose_proxy_logger.warning("Quilr guardrail: No API key, skipping pre-call check")
+            return data
+
+        # Check if guardrail should be applied based on filters
+        if not self._should_apply_guardrail(data.get("model"), user_api_key_dict):
+            verbose_proxy_logger.info("Quilr pre-call: skipped (filter)")
             return data
 
         messages = data.get("messages")
@@ -155,17 +198,11 @@ class QuilrGuardrail(CustomGuardrail):
 
         try:
             result = await self._call_quilr_api({"messages": messages})
-
             status = result.get("status", "safe")
             categories = result.get("categories_detected", [])
 
-            verbose_proxy_logger.debug(
-                "Quilr guardrail pre-call: status=%s, categories=%s",
-                status,
-                categories
-            )
-
             if status == "blocked":
+                verbose_proxy_logger.info("Quilr pre-call: blocked")
                 raise RejectedRequestError(
                     message=self._format_block_message(categories),
                     model=data.get("model", ""),
@@ -177,17 +214,15 @@ class QuilrGuardrail(CustomGuardrail):
                 redacted_messages = result.get("messages")
                 if redacted_messages:
                     data["messages"] = redacted_messages
-                    verbose_proxy_logger.info(
-                        "Quilr guardrail: Request messages redacted, categories: %s",
-                        categories
-                    )
+                    verbose_proxy_logger.info("Quilr pre-call: redacted")
 
+            verbose_proxy_logger.info("Quilr pre-call: passed")
             return data
 
         except RejectedRequestError:
             raise
         except Exception as e:
-            verbose_proxy_logger.error("Quilr guardrail pre-call error: %s", str(e))
+            verbose_proxy_logger.error("Quilr pre-call: error - %s", str(e))
             raise
 
     async def async_post_call_success_hook(
@@ -203,8 +238,14 @@ class QuilrGuardrail(CustomGuardrail):
         - If redacted: modifies response content with redacted version
         - If safe: passes through unchanged
         """
+        verbose_proxy_logger.info("Quilr post-call: response received")
+
         if not self.api_key:
-            verbose_proxy_logger.warning("Quilr guardrail: No API key, skipping post-call check")
+            return response
+
+        # Check if guardrail should be applied based on filters
+        if not self._should_apply_guardrail(data.get("model"), user_api_key_dict):
+            verbose_proxy_logger.info("Quilr post-call: skipped (filter)")
             return response
 
         if not isinstance(response, litellm.ModelResponse):
@@ -220,17 +261,11 @@ class QuilrGuardrail(CustomGuardrail):
 
             try:
                 result = await self._call_quilr_api({"text": content})
-
                 status = result.get("status", "safe")
                 categories = result.get("categories_detected", [])
 
-                verbose_proxy_logger.debug(
-                    "Quilr guardrail post-call: status=%s, categories=%s",
-                    status,
-                    categories
-                )
-
                 if status == "blocked":
+                    verbose_proxy_logger.info("Quilr post-call: blocked")
                     raise RejectedRequestError(
                         message=self._format_block_message(categories),
                         model=data.get("model", ""),
@@ -242,15 +277,13 @@ class QuilrGuardrail(CustomGuardrail):
                     processed_text = result.get("processed_text")
                     if processed_text:
                         choice.message.content = processed_text
-                        verbose_proxy_logger.info(
-                            "Quilr guardrail: Response redacted, categories: %s",
-                            categories
-                        )
+                        verbose_proxy_logger.info("Quilr post-call: redacted")
 
             except RejectedRequestError:
                 raise
             except Exception as e:
-                verbose_proxy_logger.error("Quilr guardrail post-call error: %s", str(e))
+                verbose_proxy_logger.error("Quilr post-call: error - %s", str(e))
                 raise
 
+        verbose_proxy_logger.info("Quilr post-call: passed")
         return response

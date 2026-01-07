@@ -28,3 +28,17 @@ guardrails:
 QUILR_GUARDRAILS_KEY=sk-quilr-XXXXXXXXX
 QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
 ```
+
+### Optional Filtering
+
+You can optionally limit which requests have guardrails applied using these environment variables:
+
+```bash
+# Only apply guardrails to specific models (comma-separated)
+APPLY_QUILR_GUARDRAILS_FOR_MODELS=gpt-4,gpt-4o,claude-3-opus
+
+# Only apply guardrails to specific API key names (comma-separated)
+APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES=production-key,user-facing-key
+```
+
+If neither variable is set, guardrails apply to all requests. If both are set, a request must match both filters (AND logic) for guardrails to be applied.
