@@ -7,27 +7,14 @@
 
 ### Using with litellm
 
-- Add the following to your litellm config.yaml file
+1. Set the following environment variables
 
-```yaml
-guardrails:
-  - guardrail_name: "quilr-input"
-    litellm_params:
-      guardrail: quilr_litellm_guardrails.QuilrGuardrail
-      mode: "pre_call"
-
-  - guardrail_name: "quilr-input-duringcall"
-    litellm_params:
-      guardrail: quilr_litellm_guardrails.QuilrGuardrail
-      mode: "during_call"
-
-  - guardrail_name: "quilr-output"
-    litellm_params:
-      guardrail: quilr_litellm_guardrails.QuilrGuardrail
-      mode: "post_call"
+```bash
+QUILR_GUARDRAILS_KEY=sk-quilr-XXXXXXXXX
+QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
 ```
 
-### Guardrail Modes
+2. Add guardrails to your litellm `config.yaml` file. Choose the modes you need:
 
 | Mode | When it runs | What it checks | Latency impact |
 |------|-------------|----------------|----------------|
@@ -35,16 +22,50 @@ guardrails:
 | `during_call` | In parallel with LLM call | Input | No added latency |
 | `post_call` | After LLM call | Output | Adds guardrail latency |
 
+**Example: Input guardrail only (pre_call)**
+```yaml
+guardrails:
+  - guardrail_name: "quilr-input"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrGuardrail
+      mode: "pre_call"
+```
+
+**Example: Input guardrail with lower latency (during_call)**
+```yaml
+guardrails:
+  - guardrail_name: "quilr-input-duringcall"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrGuardrail
+      mode: "during_call"
+```
+
+**Example: Output guardrail only (post_call)**
+```yaml
+guardrails:
+  - guardrail_name: "quilr-output"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrGuardrail
+      mode: "post_call"
+```
+
+**Example: Both input and output guardrails**
+```yaml
+guardrails:
+  - guardrail_name: "quilr-input"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrGuardrail
+      mode: "pre_call"
+
+  - guardrail_name: "quilr-output"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrGuardrail
+      mode: "post_call"
+```
+
 **When to use `during_call` vs `pre_call`:**
 - Use `during_call` for better latency - guardrail runs concurrently with LLM
 - Use `pre_call` if you want to avoid wasting LLM compute on blocked requests
-
-- Set the following environment variables
-
-```bash
-QUILR_GUARDRAILS_KEY=sk-quilr-XXXXXXXXX
-QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
-```
 
 ### Optional Filtering
 
