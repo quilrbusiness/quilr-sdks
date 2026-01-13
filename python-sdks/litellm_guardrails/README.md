@@ -16,11 +16,28 @@ guardrails:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "pre_call"
 
+  - guardrail_name: "quilr-input-duringcall"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrGuardrail
+      mode: "during_call"
+
   - guardrail_name: "quilr-output"
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "post_call"
 ```
+
+### Guardrail Modes
+
+| Mode | When it runs | What it checks | Latency impact |
+|------|-------------|----------------|----------------|
+| `pre_call` | Before LLM call (sequential) | Input | Adds guardrail latency |
+| `during_call` | In parallel with LLM call | Input | No added latency |
+| `post_call` | After LLM call | Output | Adds guardrail latency |
+
+**When to use `during_call` vs `pre_call`:**
+- Use `during_call` for better latency - guardrail runs concurrently with LLM
+- Use `pre_call` if you want to avoid wasting LLM compute on blocked requests
 
 - Set the following environment variables
 

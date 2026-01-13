@@ -18,6 +18,11 @@ Usage in LiteLLM config.yaml:
           guardrail: quilr_litellm_guardrails.QuilrGuardrail
           mode: "pre_call"              # checks input before LLM call
 
+      - guardrail_name: "quilr-input-duringcall"
+        litellm_params:
+          guardrail: quilr_litellm_guardrails.QuilrGuardrail
+          mode: "during_call"           # checks input in parallel with LLM call
+
       - guardrail_name: "quilr-output"
         litellm_params:
           guardrail: quilr_litellm_guardrails.QuilrGuardrail
@@ -37,6 +42,13 @@ Usage in API requests:
 Behavior:
     - quilr-input (pre_call): Checks messages before sending to LLM
         - blocked: Request rejected with error
+        - redacted: Messages replaced with redacted version
+        - safe: Passes through unchanged
+
+    - quilr-input-duringcall (during_call): Checks messages in parallel with LLM call
+        - Runs concurrently with LLM call (no added latency)
+        - Response not returned until both guardrail and LLM complete
+        - blocked: Response rejected with error
         - redacted: Messages replaced with redacted version
         - safe: Passes through unchanged
 
@@ -184,6 +196,24 @@ class QuilrGuardrail(CustomGuardrail):
         """
         verbose_proxy_logger.info("Quilr pre-call: request received")
 
+        # DEBUG: Block everything to test if guardrail is invoked
+        raise RejectedRequestError(
+            message="DEBUG: Quilr guardrail is blocking everything",
+            model=data.get("model", ""),
+            llm_provider="quilr_guardrail",
+            request_data=data,
+        )
+
+        # DEBUG: Write to file
+        with open("/Users/praneeth/Desktop/debug.txt", "a") as f:
+            f.write("=" * 60 + "\n")
+            f.write("QUILR PRE-CALL DEBUG\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"call_type: {call_type}\n")
+            f.write(f"data keys: {list(data.keys())}\n")
+            f.write(f"full data: {data}\n")
+            f.write("=" * 60 + "\n\n")
+
         if not self.api_key:
             return data
 
@@ -225,6 +255,73 @@ class QuilrGuardrail(CustomGuardrail):
             verbose_proxy_logger.error("Quilr pre-call: error - %s", str(e))
             raise
 
+    async def async_moderation_hook(
+        self,
+        data: dict,
+        user_api_key_dict: UserAPIKeyAuth,
+        call_type: Literal[
+            "completion",
+            "text_completion",
+            "embeddings",
+            "image_generation",
+            "moderation",
+            "audio_transcription",
+            "pass_through_endpoint",
+            "rerank",
+        ],
+    ):
+        """
+        Check request content in parallel with LLM call (during_call mode).
+
+        Runs concurrently with the LLM call. Response is not returned until
+        both the guardrail check and LLM call complete.
+
+        - If blocked: raises exception (response discarded)
+        - If redacted: replaces messages with redacted version
+        - If safe: passes through unchanged
+        """
+        verbose_proxy_logger.info("Quilr during-call: request received")
+
+        if not self.api_key:
+            return
+
+        # Check if guardrail should be applied based on filters
+        if not self._should_apply_guardrail(data.get("model"), user_api_key_dict):
+            verbose_proxy_logger.info("Quilr during-call: skipped (filter)")
+            return
+
+        messages = data.get("messages")
+        if not messages:
+            return
+
+        try:
+            result = await self._call_quilr_api({"messages": messages})
+            status = result.get("status", "safe")
+            categories = result.get("categories_detected", [])
+
+            if status == "blocked":
+                verbose_proxy_logger.info("Quilr during-call: blocked")
+                raise RejectedRequestError(
+                    message=self._format_block_message(categories),
+                    model=data.get("model", ""),
+                    llm_provider="quilr_guardrail",
+                    request_data=data,
+                )
+
+            if status == "redacted":
+                redacted_messages = result.get("messages")
+                if redacted_messages:
+                    data["messages"] = redacted_messages
+                    verbose_proxy_logger.info("Quilr during-call: redacted")
+
+            verbose_proxy_logger.info("Quilr during-call: passed")
+
+        except RejectedRequestError:
+            raise
+        except Exception as e:
+            verbose_proxy_logger.error("Quilr during-call: error - %s", str(e))
+            raise
+
     async def async_post_call_success_hook(
         self,
         data: dict,
@@ -239,6 +336,16 @@ class QuilrGuardrail(CustomGuardrail):
         - If safe: passes through unchanged
         """
         verbose_proxy_logger.info("Quilr post-call: response received")
+
+        # DEBUG: Write to file
+        with open("/Users/praneeth/Desktop/debug.txt", "a") as f:
+            f.write("=" * 60 + "\n")
+            f.write("QUILR POST-CALL DEBUG\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"response type: {type(response)}\n")
+            f.write(f"response: {response}\n")
+            f.write(f"data keys: {list(data.keys())}\n")
+            f.write("=" * 60 + "\n\n")
 
         if not self.api_key:
             return response
