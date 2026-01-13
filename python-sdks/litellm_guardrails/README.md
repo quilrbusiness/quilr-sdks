@@ -16,11 +16,11 @@ QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
 
 2. Add guardrails to your litellm `config.yaml` file. Choose the modes you need:
 
-| Mode | When it runs | What it checks | Latency impact |
-|------|-------------|----------------|----------------|
-| `pre_call` | Before LLM call (sequential) | Input | Adds guardrail latency |
-| `during_call` | In parallel with LLM call | Input | No added latency |
-| `post_call` | After LLM call | Output | Adds guardrail latency |
+| Mode | When it runs | What it checks | Pros | Cons |
+|------|-------------|----------------|------|------|
+| `pre_call` | Before LLM call (sequential) | Input | Can block malicious requests before they reach the LLM, prevents data leakage | Adds minimal latency |
+| `during_call` | In parallel with LLM call | Input | No added latency | Cannot prevent data leakage or attacks (LLM processes request before guardrail completes). Does not work with Responses API due to LiteLLM limitation |
+| `post_call` | After LLM call | Output | Can check LLM responses for policy violations | Adds guardrail latency. Only needed if response needs to be checked with guardrails |
 
 **Example: Input guardrail only (pre_call)**
 ```yaml
