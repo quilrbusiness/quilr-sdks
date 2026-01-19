@@ -242,6 +242,7 @@ class QuilrGuardrail(CustomGuardrail):
             "audio_transcription",
             "pass_through_endpoint",
             "rerank",
+            "responses",
             "aresponses",
         ],
     ) -> Optional[Union[Exception, str, dict]]:
@@ -265,7 +266,7 @@ class QuilrGuardrail(CustomGuardrail):
             return data
 
         # Determine if this is a Responses API call
-        is_responses_api = call_type == "aresponses"
+        is_responses_api = call_type in ("responses", "aresponses")
 
         if is_responses_api:
             # Handle OpenAI Responses API format
@@ -337,6 +338,7 @@ class QuilrGuardrail(CustomGuardrail):
             "audio_transcription",
             "pass_through_endpoint",
             "rerank",
+            "responses",
             "aresponses",
         ],
     ):
@@ -363,7 +365,7 @@ class QuilrGuardrail(CustomGuardrail):
             return
 
         # Determine if this is a Responses API call
-        is_responses_api = call_type == "aresponses"
+        is_responses_api = call_type in ("responses", "aresponses")
 
         if is_responses_api:
             # Handle OpenAI Responses API format
