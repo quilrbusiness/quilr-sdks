@@ -1,14 +1,16 @@
-"""
-Quilr Guardrails Integration for LiteLLM
+r"""Quilr Guardrails Integration for LiteLLM.
 
 This module provides a custom guardrail class that integrates Quilr's guardrails API
 with LiteLLM proxy for both request-side and response-side content checking.
 
 Environment Variables:
     QUILR_GUARDRAILS_KEY: API key for Quilr guardrails (required)
-    QUILR_GUARDRAILS_BASE_URL: Base URL for Quilr guardrails API (default: https://guardrails.quilr.ai)
-    APPLY_QUILR_GUARDRAILS_FOR_MODELS: Comma-separated list of models to apply guardrails to (optional, if not set applies to all)
-    APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES: Comma-separated list of API key names to apply guardrails to (optional, if not set applies to all)
+    QUILR_GUARDRAILS_BASE_URL: Base URL for Quilr guardrails API
+        (default: https://guardrails.quilr.ai)
+    APPLY_QUILR_GUARDRAILS_FOR_MODELS: Comma-separated list of models to apply
+        guardrails to (optional, if not set applies to all)
+    APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES: Comma-separated list of API key names
+        to apply guardrails to (optional, if not set applies to all)
 
 Usage in LiteLLM config.yaml:
 
@@ -30,9 +32,9 @@ Usage in LiteLLM config.yaml:
 
 Usage in API requests:
 
-    curl -X POST http://localhost:4000/v1/chat/completions \\
-      -H "Authorization: Bearer sk-xxx" \\
-      -H "Content-Type: application/json" \\
+    curl -X POST http://localhost:4000/v1/chat/completions \
+      -H "Authorization: Bearer sk-xxx" \
+      -H "Content-Type: application/json" \
       -d '{
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "Hello"}],
@@ -75,8 +77,7 @@ from litellm.types.llms.openai import ResponsesAPIResponse
 
 
 class QuilrGuardrail(CustomGuardrail):
-    """
-    Custom guardrail that integrates with Quilr's guardrails API.
+    """Custom guardrail that integrates with Quilr's guardrails API.
 
     Handles both request-side (input) and response-side (output) checking:
     - Request-side: Checks messages before sending to LLM, can redact or block
@@ -84,6 +85,7 @@ class QuilrGuardrail(CustomGuardrail):
     """
 
     def __init__(self, **kwargs):
+        """Initialize the Quilr guardrail with configuration from environment variables."""
         self.api_key = os.getenv("QUILR_GUARDRAILS_KEY")
         self.api_base = os.getenv("QUILR_GUARDRAILS_BASE_URL", "https://guardrails.quilr.ai")
 
@@ -102,14 +104,14 @@ class QuilrGuardrail(CustomGuardrail):
         super().__init__(**kwargs)
 
     async def _call_quilr_api(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Make a request to Quilr's guardrails API.
+        """Make a request to Quilr's guardrails API.
 
         Args:
             payload: Request body (either {"messages": [...]} or {"text": "..."})
 
         Returns:
             API response as dictionary
+
         """
         async_client = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.LoggingCallback
@@ -141,8 +143,7 @@ class QuilrGuardrail(CustomGuardrail):
     def _responses_input_to_messages(
         self, input_data: Union[str, List[Dict]], instructions: Optional[str]
     ) -> List[Dict[str, str]]:
-        """
-        Convert OpenAI Responses API input format to chat messages format.
+        """Convert OpenAI Responses API input format to chat messages format.
 
         Args:
             input_data: Either a string or array of message objects
@@ -150,6 +151,7 @@ class QuilrGuardrail(CustomGuardrail):
 
         Returns:
             List of message dictionaries in chat format
+
         """
         messages = []
 
@@ -168,8 +170,7 @@ class QuilrGuardrail(CustomGuardrail):
     def _messages_to_responses_input(
         self, messages: List[Dict[str, str]], original_input_was_string: bool
     ) -> tuple[Optional[str], Union[str, List[Dict], None]]:
-        """
-        Convert chat messages format back to OpenAI Responses API format.
+        """Convert chat messages format back to OpenAI Responses API format.
 
         Args:
             messages: List of message dictionaries in chat format
@@ -177,6 +178,7 @@ class QuilrGuardrail(CustomGuardrail):
 
         Returns:
             Tuple of (instructions, input) in Responses API format
+
         """
         instructions = None
         input_messages = []
@@ -197,8 +199,7 @@ class QuilrGuardrail(CustomGuardrail):
     def _should_apply_guardrail(
         self, model: Optional[str], user_api_key_dict: UserAPIKeyAuth
     ) -> bool:
-        """
-        Check if guardrail should be applied based on filters.
+        """Check if guardrail should be applied based on filters.
 
         Returns True if:
         - No filters are configured (apply to all), OR
@@ -210,6 +211,7 @@ class QuilrGuardrail(CustomGuardrail):
 
         Returns:
             True if guardrail should be applied, False to skip
+
         """
         # If no filters configured, apply to all
         if not self.allowed_models and not self.allowed_key_names:
@@ -227,6 +229,85 @@ class QuilrGuardrail(CustomGuardrail):
                 return False
 
         return True
+
+    def _extract_messages_from_request(
+        self, data: dict, is_responses_api: bool
+    ) -> tuple[Optional[List[Dict]], bool]:
+        """Extract messages from request data.
+
+        Args:
+            data: Request data dictionary
+            is_responses_api: Whether this is a Responses API call
+
+        Returns:
+            Tuple of (messages, original_input_was_string). Returns (None, False) if no messages.
+
+        """
+        if is_responses_api:
+            input_data = data.get("input")
+            instructions = data.get("instructions")
+            if not input_data:
+                return None, False
+            original_input_was_string = isinstance(input_data, str)
+            messages = self._responses_input_to_messages(input_data, instructions)
+            return messages, original_input_was_string
+
+        messages = data.get("messages")
+        return messages if messages else None, False
+
+    def _apply_redacted_messages(
+        self,
+        data: dict,
+        redacted_messages: List[Dict],
+        is_responses_api: bool,
+        original_input_was_string: bool,
+    ) -> None:
+        """Apply redacted messages back to request data.
+
+        Args:
+            data: Request data dictionary to modify
+            redacted_messages: Redacted messages from guardrail API
+            is_responses_api: Whether this is a Responses API call
+            original_input_was_string: Whether the original input was a string
+
+        """
+        if is_responses_api:
+            new_instructions, new_input = self._messages_to_responses_input(
+                redacted_messages, original_input_was_string
+            )
+            if new_instructions is not None:
+                data["instructions"] = new_instructions
+            elif "instructions" in data:
+                del data["instructions"]
+            if new_input is not None:
+                data["input"] = new_input
+        else:
+            data["messages"] = redacted_messages
+
+    def _collect_output_text_items(self, response: ResponsesAPIResponse) -> List:
+        """Collect all output_text items from a Responses API response.
+
+        Args:
+            response: ResponsesAPIResponse object
+
+        Returns:
+            List of output_text content items
+
+        """
+        output_text_items = []
+        if not response.output:
+            return output_text_items
+
+        for output_item in response.output:
+            if not hasattr(output_item, "content") or not output_item.content:
+                continue
+            for content_item in output_item.content:
+                if not hasattr(content_item, "type") or content_item.type != "output_text":
+                    continue
+                if hasattr(content_item, "text") and content_item.text:
+                    output_text_items.append(content_item)
+
+        return output_text_items
 
     async def async_pre_call_hook(
         self,
@@ -246,8 +327,7 @@ class QuilrGuardrail(CustomGuardrail):
             "aresponses",
         ],
     ) -> Optional[Union[Exception, str, dict]]:
-        """
-        Check request content before sending to LLM.
+        """Check request content before sending to LLM.
 
         Supports both Chat Completions API (messages) and Responses API (input/instructions).
 
@@ -260,29 +340,16 @@ class QuilrGuardrail(CustomGuardrail):
         if not self.api_key:
             return data
 
-        # Check if guardrail should be applied based on filters
         if not self._should_apply_guardrail(data.get("model"), user_api_key_dict):
             verbose_proxy_logger.info("Quilr pre-call: skipped (filter)")
             return data
 
-        # Determine if this is a Responses API call
         is_responses_api = call_type in ("responses", "aresponses")
-
-        if is_responses_api:
-            # Handle OpenAI Responses API format
-            input_data = data.get("input")
-            instructions = data.get("instructions")
-
-            if not input_data:
-                return data
-
-            original_input_was_string = isinstance(input_data, str)
-            messages = self._responses_input_to_messages(input_data, instructions)
-        else:
-            # Handle Chat Completions API format
-            messages = data.get("messages")
-            if not messages:
-                return data
+        messages, original_input_was_string = self._extract_messages_from_request(
+            data, is_responses_api
+        )
+        if not messages:
+            return data
 
         try:
             result = await self._call_quilr_api({"messages": messages})
@@ -301,19 +368,9 @@ class QuilrGuardrail(CustomGuardrail):
             if status == "redacted":
                 redacted_messages = result.get("messages")
                 if redacted_messages:
-                    if is_responses_api:
-                        # Convert back to Responses API format
-                        new_instructions, new_input = self._messages_to_responses_input(
-                            redacted_messages, original_input_was_string
-                        )
-                        if new_instructions is not None:
-                            data["instructions"] = new_instructions
-                        elif "instructions" in data:
-                            del data["instructions"]
-                        if new_input is not None:
-                            data["input"] = new_input
-                    else:
-                        data["messages"] = redacted_messages
+                    self._apply_redacted_messages(
+                        data, redacted_messages, is_responses_api, original_input_was_string
+                    )
                     verbose_proxy_logger.info("Quilr pre-call: redacted")
 
             verbose_proxy_logger.info("Quilr pre-call: passed")
@@ -342,8 +399,7 @@ class QuilrGuardrail(CustomGuardrail):
             "aresponses",
         ],
     ):
-        """
-        Check request content in parallel with LLM call (during_call mode).
+        """Check request content in parallel with LLM call (during_call mode).
 
         Supports both Chat Completions API (messages) and Responses API (input/instructions).
 
@@ -359,29 +415,16 @@ class QuilrGuardrail(CustomGuardrail):
         if not self.api_key:
             return
 
-        # Check if guardrail should be applied based on filters
         if not self._should_apply_guardrail(data.get("model"), user_api_key_dict):
             verbose_proxy_logger.info("Quilr during-call: skipped (filter)")
             return
 
-        # Determine if this is a Responses API call
         is_responses_api = call_type in ("responses", "aresponses")
-
-        if is_responses_api:
-            # Handle OpenAI Responses API format
-            input_data = data.get("input")
-            instructions = data.get("instructions")
-
-            if not input_data:
-                return
-
-            original_input_was_string = isinstance(input_data, str)
-            messages = self._responses_input_to_messages(input_data, instructions)
-        else:
-            # Handle Chat Completions API format
-            messages = data.get("messages")
-            if not messages:
-                return
+        messages, original_input_was_string = self._extract_messages_from_request(
+            data, is_responses_api
+        )
+        if not messages:
+            return
 
         try:
             result = await self._call_quilr_api({"messages": messages})
@@ -400,19 +443,9 @@ class QuilrGuardrail(CustomGuardrail):
             if status == "redacted":
                 redacted_messages = result.get("messages")
                 if redacted_messages:
-                    if is_responses_api:
-                        # Convert back to Responses API format
-                        new_instructions, new_input = self._messages_to_responses_input(
-                            redacted_messages, original_input_was_string
-                        )
-                        if new_instructions is not None:
-                            data["instructions"] = new_instructions
-                        elif "instructions" in data:
-                            del data["instructions"]
-                        if new_input is not None:
-                            data["input"] = new_input
-                    else:
-                        data["messages"] = redacted_messages
+                    self._apply_redacted_messages(
+                        data, redacted_messages, is_responses_api, original_input_was_string
+                    )
                     verbose_proxy_logger.info("Quilr during-call: redacted")
 
             verbose_proxy_logger.info("Quilr during-call: passed")
@@ -429,8 +462,7 @@ class QuilrGuardrail(CustomGuardrail):
         user_api_key_dict: UserAPIKeyAuth,
         response,
     ):
-        """
-        Check LLM response before returning to user.
+        """Check LLM response before returning to user.
 
         Supports both Chat Completions API (ModelResponse) and Responses API (ResponsesAPIResponse).
 
@@ -503,24 +535,12 @@ class QuilrGuardrail(CustomGuardrail):
         self, response: ResponsesAPIResponse, data: dict
     ) -> ResponsesAPIResponse:
         """Check output for OpenAI Responses API responses."""
-        # Collect all output_text items and their text content
-        output_text_items = []
-
-        if response.output:
-            for output_item in response.output:
-                # Check if this is a message output (has content attribute)
-                if hasattr(output_item, "content") and output_item.content:
-                    for content_item in output_item.content:
-                        # Check if this is an output_text item
-                        if hasattr(content_item, "type") and content_item.type == "output_text":
-                            if hasattr(content_item, "text") and content_item.text:
-                                output_text_items.append(content_item)
+        output_text_items = self._collect_output_text_items(response)
 
         if not output_text_items:
             verbose_proxy_logger.info("Quilr post-call: no output text found")
             return response
 
-        # Concatenate all text content
         all_text = "\n".join(item.text for item in output_text_items)
 
         try:
@@ -540,9 +560,7 @@ class QuilrGuardrail(CustomGuardrail):
             if status == "redacted":
                 processed_text = result.get("processed_text")
                 if processed_text:
-                    # Replace first output_text item with redacted text
                     output_text_items[0].text = processed_text
-                    # Clear other output_text items
                     for item in output_text_items[1:]:
                         item.text = ""
                     verbose_proxy_logger.info("Quilr post-call: redacted")
