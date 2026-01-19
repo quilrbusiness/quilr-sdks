@@ -19,7 +19,7 @@ QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
 | Mode | When it runs | What it checks | Pros | Cons |
 |------|-------------|----------------|------|------|
 | `pre_call` | Before LLM call (sequential) | Input | Can block malicious requests before they reach the LLM, prevents data leakage | Adds minimal latency |
-| `during_call` | In parallel with LLM call | Input | No added latency | Cannot prevent data leakage or attacks (LLM processes request before guardrail completes). Does not work with Responses API due to LiteLLM limitation |
+| `during_call` | In parallel with LLM call | Input | No added latency | Cannot prevent data leakage or attacks (LLM processes request before guardrail completes). |
 | `post_call` | After LLM call | Output | Can check LLM responses for policy violations | Adds guardrail latency. Only needed if response needs to be checked with guardrails |
 
 **Example: Input guardrail only (pre_call)**
@@ -29,6 +29,7 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "pre_call"
+    default_on: true
 ```
 
 **Example: Input guardrail with lower latency (during_call)**
@@ -38,6 +39,7 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "during_call"
+    default_on: true
 ```
 
 **Example: Output guardrail only (post_call)**
@@ -47,6 +49,7 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "post_call"
+    default_on: true
 ```
 
 **Example: Both input and output guardrails**
@@ -56,11 +59,13 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "pre_call"
+    default_on: true
 
   - guardrail_name: "quilr-output"
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "post_call"
+    default_on: true
 ```
 
 **When to use `during_call` vs `pre_call`:**
