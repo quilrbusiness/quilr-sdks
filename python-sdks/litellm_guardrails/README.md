@@ -12,6 +12,7 @@
 ```bash
 QUILR_GUARDRAILS_KEY=sk-quilr-XXXXXXXXX
 QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
+QUILR_GUARDRAILS_TIMEOUT=3  # Optional: timeout in seconds (default: 3). If timeout or API error occurs, request passes through.
 ```
 
 2. Add guardrails to your litellm `config.yaml` file. Choose the modes you need:

@@ -7,6 +7,8 @@ Environment Variables:
     QUILR_GUARDRAILS_KEY: API key for Quilr guardrails (required)
     QUILR_GUARDRAILS_BASE_URL: Base URL for Quilr guardrails API
         (default: https://guardrails.quilr.ai)
+    QUILR_GUARDRAILS_TIMEOUT: Timeout in seconds for guardrails API calls
+        (default: 3). If timeout or any API error occurs, request passes through.
     APPLY_QUILR_GUARDRAILS_FOR_MODELS: Comma-separated list of models to apply
         guardrails to (optional, if not set applies to all)
     APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES: Comma-separated list of API key names
@@ -88,6 +90,7 @@ class QuilrGuardrail(CustomGuardrail):
         """Initialize the Quilr guardrail with configuration from environment variables."""
         self.api_key = os.getenv("QUILR_GUARDRAILS_KEY")
         self.api_base = os.getenv("QUILR_GUARDRAILS_BASE_URL", "https://guardrails.quilr.ai")
+        self.timeout = int(os.getenv("QUILR_GUARDRAILS_TIMEOUT", "3"))
 
         # Parse optional filters (comma-separated lists)
         models_env = os.getenv("APPLY_QUILR_GUARDRAILS_FOR_MODELS", "")
@@ -128,7 +131,7 @@ class QuilrGuardrail(CustomGuardrail):
             endpoint,
             headers=headers,
             json=payload,
-            timeout=10,
+            timeout=self.timeout,
         )
 
         response.raise_for_status()
@@ -378,9 +381,8 @@ class QuilrGuardrail(CustomGuardrail):
 
         except RejectedRequestError:
             raise
-        except Exception as e:
-            verbose_proxy_logger.error("Quilr pre-call: error - %s", str(e))
-            raise
+        except Exception:
+            return data
 
     async def async_moderation_hook(
         self,
@@ -452,9 +454,8 @@ class QuilrGuardrail(CustomGuardrail):
 
         except RejectedRequestError:
             raise
-        except Exception as e:
-            verbose_proxy_logger.error("Quilr during-call: error - %s", str(e))
-            raise
+        except Exception:
+            return
 
     async def async_post_call_success_hook(
         self,
@@ -524,9 +525,8 @@ class QuilrGuardrail(CustomGuardrail):
 
             except RejectedRequestError:
                 raise
-            except Exception as e:
-                verbose_proxy_logger.error("Quilr post-call: error - %s", str(e))
-                raise
+            except Exception:
+                pass
 
         verbose_proxy_logger.info("Quilr post-call: passed")
         return response
@@ -567,9 +567,8 @@ class QuilrGuardrail(CustomGuardrail):
 
         except RejectedRequestError:
             raise
-        except Exception as e:
-            verbose_proxy_logger.error("Quilr post-call: error - %s", str(e))
-            raise
+        except Exception:
+            return response
 
         verbose_proxy_logger.info("Quilr post-call: passed")
         return response
