@@ -62,6 +62,7 @@ Behavior:
         - safe: Passes through unchanged
 """
 
+import json
 import os
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -89,15 +90,21 @@ class QuilrGuardrail(CustomGuardrail):
     def __init__(self, **kwargs):
         """Initialize the Quilr guardrail with configuration from environment variables."""
         self.api_key = os.getenv("QUILR_GUARDRAILS_KEY")
-        self.api_base = os.getenv("QUILR_GUARDRAILS_BASE_URL", "https://guardrails.quilr.ai")
+        self.api_base = os.getenv(
+            "QUILR_GUARDRAILS_BASE_URL", "https://guardrails.quilr.ai"
+        )
         self.timeout = int(os.getenv("QUILR_GUARDRAILS_TIMEOUT", "3"))
 
         # Parse optional filters (comma-separated lists)
         models_env = os.getenv("APPLY_QUILR_GUARDRAILS_FOR_MODELS", "")
-        self.allowed_models = [m.strip() for m in models_env.split(",") if m.strip()] or None
+        self.allowed_models = [
+            m.strip() for m in models_env.split(",") if m.strip()
+        ] or None
 
         key_names_env = os.getenv("APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES", "")
-        self.allowed_key_names = [k.strip() for k in key_names_env.split(",") if k.strip()] or None
+        self.allowed_key_names = [
+            k.strip() for k in key_names_env.split(",") if k.strip()
+        ] or None
 
         if not self.api_key:
             verbose_proxy_logger.warning(
@@ -106,11 +113,36 @@ class QuilrGuardrail(CustomGuardrail):
 
         super().__init__(**kwargs)
 
-    async def _call_quilr_api(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _serialize_user_api_key_dict(
+        self, user_api_key_dict: UserAPIKeyAuth
+    ) -> Dict[str, Any]:
+        """Serialize UserAPIKeyAuth, excluding None values and non-serializable fields.
+
+        Args:
+            user_api_key_dict: API key authentication info
+
+        Returns:
+            Dictionary with serializable fields only
+
+        """
+        dumped = user_api_key_dict.model_dump(exclude_none=True)
+        result = {}
+        for key, value in dumped.items():
+            try:
+                json.dumps(value)
+                result[key] = value
+            except (TypeError, ValueError):
+                pass  # Skip non-serializable fields
+        return result
+
+    async def _call_quilr_api(
+        self, payload: Dict[str, Any], user_api_key_dict: UserAPIKeyAuth
+    ) -> Dict[str, Any]:
         """Make a request to Quilr's guardrails API.
 
         Args:
             payload: Request body (either {"messages": [...]} or {"text": "..."})
+            user_api_key_dict: API key authentication info to include as metadata
 
         Returns:
             API response as dictionary
@@ -126,6 +158,12 @@ class QuilrGuardrail(CustomGuardrail):
         }
 
         endpoint = f"{self.api_base.rstrip('/')}/sdk/v1/check"
+
+        # Add metadata with caller info and user API key details
+        payload["metadata"] = {
+            "caller": "litellm",
+            **self._serialize_user_api_key_dict(user_api_key_dict),
+        }
 
         response = await async_client.post(
             endpoint,
@@ -305,7 +343,10 @@ class QuilrGuardrail(CustomGuardrail):
             if not hasattr(output_item, "content") or not output_item.content:
                 continue
             for content_item in output_item.content:
-                if not hasattr(content_item, "type") or content_item.type != "output_text":
+                if (
+                    not hasattr(content_item, "type")
+                    or content_item.type != "output_text"
+                ):
                     continue
                 if hasattr(content_item, "text") and content_item.text:
                     output_text_items.append(content_item)
@@ -355,7 +396,9 @@ class QuilrGuardrail(CustomGuardrail):
             return data
 
         try:
-            result = await self._call_quilr_api({"messages": messages})
+            result = await self._call_quilr_api(
+                {"messages": messages}, user_api_key_dict
+            )
             status = result.get("status", "safe")
             categories = result.get("categories_detected", [])
 
@@ -372,7 +415,10 @@ class QuilrGuardrail(CustomGuardrail):
                 redacted_messages = result.get("messages")
                 if redacted_messages:
                     self._apply_redacted_messages(
-                        data, redacted_messages, is_responses_api, original_input_was_string
+                        data,
+                        redacted_messages,
+                        is_responses_api,
+                        original_input_was_string,
                     )
                     verbose_proxy_logger.info("Quilr pre-call: redacted")
 
@@ -429,7 +475,9 @@ class QuilrGuardrail(CustomGuardrail):
             return
 
         try:
-            result = await self._call_quilr_api({"messages": messages})
+            result = await self._call_quilr_api(
+                {"messages": messages}, user_api_key_dict
+            )
             status = result.get("status", "safe")
             categories = result.get("categories_detected", [])
 
@@ -446,7 +494,10 @@ class QuilrGuardrail(CustomGuardrail):
                 redacted_messages = result.get("messages")
                 if redacted_messages:
                     self._apply_redacted_messages(
-                        data, redacted_messages, is_responses_api, original_input_was_string
+                        data,
+                        redacted_messages,
+                        is_responses_api,
+                        original_input_was_string,
                     )
                     verbose_proxy_logger.info("Quilr during-call: redacted")
 
@@ -483,16 +534,23 @@ class QuilrGuardrail(CustomGuardrail):
 
         # Handle OpenAI Responses API format
         if isinstance(response, ResponsesAPIResponse):
-            return await self._check_responses_api_output(response, data)
+            return await self._check_responses_api_output(
+                response, data, user_api_key_dict
+            )
 
         # Handle Chat Completions API format
         if isinstance(response, litellm.ModelResponse):
-            return await self._check_chat_completions_output(response, data)
+            return await self._check_chat_completions_output(
+                response, data, user_api_key_dict
+            )
 
         return response
 
     async def _check_chat_completions_output(
-        self, response: litellm.ModelResponse, data: dict
+        self,
+        response: litellm.ModelResponse,
+        data: dict,
+        user_api_key_dict: UserAPIKeyAuth,
     ) -> litellm.ModelResponse:
         """Check output for Chat Completions API responses."""
         for choice in response.choices:
@@ -504,7 +562,9 @@ class QuilrGuardrail(CustomGuardrail):
                 continue
 
             try:
-                result = await self._call_quilr_api({"text": content})
+                result = await self._call_quilr_api(
+                    {"text": content}, user_api_key_dict
+                )
                 status = result.get("status", "safe")
                 categories = result.get("categories_detected", [])
 
@@ -532,7 +592,10 @@ class QuilrGuardrail(CustomGuardrail):
         return response
 
     async def _check_responses_api_output(
-        self, response: ResponsesAPIResponse, data: dict
+        self,
+        response: ResponsesAPIResponse,
+        data: dict,
+        user_api_key_dict: UserAPIKeyAuth,
     ) -> ResponsesAPIResponse:
         """Check output for OpenAI Responses API responses."""
         output_text_items = self._collect_output_text_items(response)
@@ -544,7 +607,7 @@ class QuilrGuardrail(CustomGuardrail):
         all_text = "\n".join(item.text for item in output_text_items)
 
         try:
-            result = await self._call_quilr_api({"text": all_text})
+            result = await self._call_quilr_api({"text": all_text}, user_api_key_dict)
             status = result.get("status", "safe")
             categories = result.get("categories_detected", [])
 
