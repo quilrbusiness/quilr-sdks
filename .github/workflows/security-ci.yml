@@ -1,0 +1,15 @@
+name: DevSecOps
+on:
+  pull_request:
+    branches:
+      - main
+      - quilr-preprod
+jobs:
+  ci-scripts:
+    uses: quilrbusiness/ci-scripts/.github/workflows/ci.yml@ci-security-tools-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      pull-requests: write
+    secrets: inherit
