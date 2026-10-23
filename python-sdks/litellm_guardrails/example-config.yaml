@@ -9,5 +9,5 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "during_call"
-    default_on: true
+      default_on: true
     

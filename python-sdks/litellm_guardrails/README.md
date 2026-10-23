@@ -30,7 +30,7 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "pre_call"
-    default_on: true
+      default_on: true
 ```
 
 **Example: Input guardrail with lower latency (during_call)**
@@ -40,7 +40,7 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "during_call"
-    default_on: true
+      default_on: true
 ```
 
 **Example: Output guardrail only (post_call)**
@@ -50,7 +50,7 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "post_call"
-    default_on: true
+      default_on: true
 ```
 
 **Example: Both input and output guardrails**
@@ -60,18 +60,45 @@ guardrails:
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "pre_call"
-    default_on: true
+      default_on: true
 
   - guardrail_name: "quilr-output"
     litellm_params:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "post_call"
-    default_on: true
+      default_on: true
 ```
 
 **When to use `during_call` vs `pre_call`:**
 - Use `during_call` for better latency - guardrail runs concurrently with LLM
 - Use `pre_call` if you want to avoid wasting LLM compute on blocked requests
+
+### Checking all API formats (`QuilrUnifiedGuardrail`)
+
+`QuilrGuardrail` checks the OpenAI Chat Completions (`/v1/chat/completions`) and Responses (`/v1/responses`) formats. Other formats are checked only partly or not at all, for example Anthropic `/v1/messages` (the response is not checked) and Gemini `generateContent` (neither the request nor the response is checked).
+
+To check these formats too, use `QuilrUnifiedGuardrail` instead. It works with all the modes and examples above. Only the `guardrail` line changes:
+
+```yaml
+guardrails:
+  - guardrail_name: "quilr-input"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
+      mode: "pre_call"
+      default_on: true
+
+  - guardrail_name: "quilr-output"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
+      mode: "post_call"
+      default_on: true
+```
+
+- LiteLLM extracts the text from each format it has a guardrail translator for and passes it to Quilr, so the same Quilr checks run for those formats.
+- Requests: only user messages are checked, the same as `QuilrGuardrail`. For formats where LiteLLM gives no message roles (e.g. Gemini), all request text is checked.
+- Blocking, redaction, the model filter and the timeout behave the same as `QuilrGuardrail`.
+- Key-name filter: LiteLLM does not pass the key name on every route (e.g. Anthropic `/v1/messages`). On those routes, if `APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES` is set, requests are not checked.
+- Requires a LiteLLM version with `apply_guardrail` support (tested with 1.106.2).
 
 ### Optional Filtering
 

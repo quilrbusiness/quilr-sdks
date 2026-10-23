@@ -60,6 +60,15 @@ Behavior:
         - blocked: Response rejected with error
         - redacted: Response content replaced with redacted version
         - safe: Passes through unchanged
+
+All API formats (QuilrUnifiedGuardrail):
+    QuilrGuardrail reads only the OpenAI Chat Completions and Responses
+    formats. To also check other formats (e.g. Anthropic /v1/messages,
+    Gemini generateContent), use QuilrUnifiedGuardrail in the same config
+    instead. It uses LiteLLM's apply_guardrail interface and needs
+    a LiteLLM version that supports it (tested with 1.106.2):
+
+          guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
 """
 
 import json
@@ -77,6 +86,14 @@ from litellm.llms.custom_httpx.http_handler import (
     httpxSpecialProvider,
 )
 from litellm.types.llms.openai import ResponsesAPIResponse
+
+# Used only by QuilrUnifiedGuardrail. Older LiteLLM versions don't have this
+# exception (or apply_guardrail support); the fallback keeps this module
+# importable there, so QuilrGuardrail keeps working.
+try:
+    from litellm.exceptions import GuardrailRaisedException
+except ImportError:
+    GuardrailRaisedException = RejectedRequestError
 
 
 class QuilrGuardrail(CustomGuardrail):
@@ -635,3 +652,309 @@ class QuilrGuardrail(CustomGuardrail):
 
         verbose_proxy_logger.info("Quilr post-call: passed")
         return response
+
+
+class QuilrUnifiedGuardrail(QuilrGuardrail):
+    """Quilr guardrail built on LiteLLM's unified ``apply_guardrail`` interface.
+
+    Use this class to check API formats that ``QuilrGuardrail`` does not read,
+    such as Anthropic ``/v1/messages`` and Gemini ``generateContent``.
+    LiteLLM extracts the texts from each format it has a guardrail translator
+    for, passes them to ``apply_guardrail``, and writes the checked texts back.
+
+    Behavior (same Quilr endpoint and results as ``QuilrGuardrail``):
+        - Request: user texts are checked. If LiteLLM gives no message roles
+          (e.g. Gemini), all texts are checked.
+        - Response: each text is checked.
+        - blocked: the call is rejected with an error
+        - redacted: texts are replaced with Quilr's redacted versions
+        - safe: texts pass through unchanged
+        - Quilr call fails (timeout, connection or API error): texts pass
+          through unchanged
+
+    Requires a LiteLLM version with ``apply_guardrail`` support
+    (tested with 1.106.2).
+    """
+
+    async def apply_guardrail(
+        self,
+        inputs: Dict[str, Any],
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Check the texts LiteLLM extracted from a request or response.
+
+        Called by LiteLLM's guardrail translator for the request's API format.
+
+        Args:
+            inputs: Extracted content. Uses ``texts`` (list of strings) and,
+                for requests, ``structured_messages`` (messages with roles)
+            request_data: The original request data (model, metadata, ...)
+            input_type: "request" for the prompt, "response" for the answer
+            logging_obj: LiteLLM logging object (unused)
+
+        Returns:
+            ``inputs`` with ``texts`` replaced by the checked texts. LiteLLM
+            requires the list to keep the same length and order.
+
+        Raises:
+            GuardrailRaisedException: If Quilr blocks the content.
+
+        """
+        verbose_proxy_logger.info("Quilr unified %s: received", input_type)
+
+        texts = list(inputs.get("texts") or [])
+        if not self.api_key or not texts:
+            return inputs
+
+        metadata = self._caller_metadata(request_data)
+        if not self._matches_filters(request_data.get("model"), metadata):
+            verbose_proxy_logger.info("Quilr unified %s: skipped (filter)", input_type)
+            return inputs
+
+        if input_type == "request":
+            checked_texts = await self._check_request_texts(
+                texts, inputs.get("structured_messages"), metadata
+            )
+        else:
+            checked_texts = await self._check_response_texts(texts, metadata)
+
+        # A failed Quilr call returns None: fail open and keep the original texts
+        if checked_texts is None:
+            return inputs
+
+        inputs["texts"] = checked_texts
+        return inputs
+
+    async def _check_request_texts(
+        self,
+        texts: List[str],
+        structured_messages: Optional[List[Any]],
+        metadata: Dict[str, Any],
+    ) -> Optional[List[str]]:
+        """Check a request's user texts in one Quilr call.
+
+        Args:
+            texts: All texts LiteLLM extracted from the request
+            structured_messages: Request messages with roles, if available
+            metadata: Caller details sent to Quilr
+
+        Returns:
+            Checked texts (same length and order as ``texts``), or None if
+            the Quilr call failed
+
+        """
+        # Quilr checks only user messages on the request side, so only those are sent
+        indices = self._user_text_indices(texts, structured_messages)
+        messages = [{"role": "user", "content": texts[i]} for i in indices]
+
+        result = await self._post_to_quilr({"messages": messages}, metadata)
+        if result is None:
+            verbose_proxy_logger.info("Quilr unified request: error, passed through")
+            return None
+
+        self._raise_if_blocked(result, "request")
+
+        checked_texts = list(texts)
+        redacted_messages = result.get("messages")
+        if (
+            result.get("status") == "redacted"
+            and isinstance(redacted_messages, list)
+            and len(redacted_messages) == len(indices)
+        ):
+            # Quilr returns the messages in the order sent; put each one back at
+            # the position its text came from
+            for i, message in zip(indices, redacted_messages):
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str):
+                    checked_texts[i] = content
+            verbose_proxy_logger.info("Quilr unified request: redacted")
+
+        verbose_proxy_logger.info("Quilr unified request: passed")
+        return checked_texts
+
+    async def _check_response_texts(
+        self, texts: List[str], metadata: Dict[str, Any]
+    ) -> Optional[List[str]]:
+        """Check each text of a response with Quilr.
+
+        Args:
+            texts: All texts LiteLLM extracted from the response
+            metadata: Caller details sent to Quilr
+
+        Returns:
+            Checked texts (same length and order as ``texts``), or None if
+            the Quilr call failed
+
+        """
+        checked_texts = list(texts)
+        for i, text in enumerate(texts):
+            if not text:
+                continue
+
+            result = await self._post_to_quilr(
+                {"text": text, "type": "response"}, metadata
+            )
+            if result is None:
+                verbose_proxy_logger.info(
+                    "Quilr unified response: error, passed through"
+                )
+                return None
+
+            self._raise_if_blocked(result, "response")
+
+            if result.get("status") == "redacted" and result.get("processed_text"):
+                checked_texts[i] = result["processed_text"]
+                verbose_proxy_logger.info("Quilr unified response: redacted")
+
+        verbose_proxy_logger.info("Quilr unified response: passed")
+        return checked_texts
+
+    def _user_text_indices(
+        self, texts: List[str], structured_messages: Optional[List[Any]]
+    ) -> List[int]:
+        """Find which texts came from user messages.
+
+        LiteLLM's ``texts`` list has no roles, so each text is matched against
+        the user messages in ``structured_messages``.
+
+        Args:
+            texts: All texts LiteLLM extracted from the request
+            structured_messages: Request messages with roles, if available
+
+        Returns:
+            Positions in ``texts`` that belong to user messages. Every
+            position if there are no roles (e.g. Gemini) or nothing matches,
+            so nothing is skipped when roles are unknown.
+
+        """
+        user_texts = set()
+        for message in structured_messages or []:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                user_texts.add(content)
+            elif isinstance(content, list):
+                # Multi-part content, e.g. [{"type": "text", "text": "..."}, ...]
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        user_texts.add(part["text"])
+
+        indices = [i for i, text in enumerate(texts) if text in user_texts]
+        return indices or list(range(len(texts)))
+
+    def _raise_if_blocked(self, result: Dict[str, Any], input_type: str) -> None:
+        """Raise LiteLLM's guardrail exception if Quilr blocked the content.
+
+        Args:
+            result: Quilr API response
+            input_type: "request" or "response", used in the log line
+
+        Raises:
+            GuardrailRaisedException: If ``result["status"]`` is "blocked".
+
+        """
+        if result.get("status") != "blocked":
+            return
+
+        verbose_proxy_logger.info("Quilr unified %s: blocked", input_type)
+        raise GuardrailRaisedException(
+            guardrail_name=self.guardrail_name,
+            message=self._format_block_message(result.get("categories_detected", [])),
+            should_wrap_with_default_message=False,
+            blocked_content=True,
+        )
+
+    async def _post_to_quilr(
+        self, payload: Dict[str, Any], metadata: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Send a payload to Quilr's ``/sdk/v1/check`` endpoint.
+
+        Same endpoint, headers and timeout as ``QuilrGuardrail._call_quilr_api``.
+        Metadata is passed as a dict because LiteLLM does not pass a
+        ``UserAPIKeyAuth`` object to ``apply_guardrail``.
+
+        Args:
+            payload: Request body ({"messages": [...]} or {"text": ..., "type": ...})
+            metadata: Caller details added under ``payload["metadata"]``
+
+        Returns:
+            Quilr API response, or None on any error (timeout, connection,
+            HTTP status or invalid response)
+
+        """
+        payload["metadata"] = {"caller": "litellm", **metadata}
+        try:
+            async_client = get_async_httpx_client(
+                llm_provider=httpxSpecialProvider.LoggingCallback
+            )
+            response = await async_client.post(
+                f"{self.api_base.rstrip('/')}/sdk/v1/check",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            return None
+
+    def _caller_metadata(self, request_data: dict) -> Dict[str, Any]:
+        """Collect caller details (API key name, team, user, ...) for Quilr.
+
+        LiteLLM stores them in the request metadata with a ``user_api_key_``
+        prefix, which is removed here (e.g. ``user_api_key_key_name`` ->
+        ``key_name``). Which fields are present depends on the LiteLLM route.
+
+        Args:
+            request_data: The original request data
+
+        Returns:
+            JSON-serializable caller details, without None values
+
+        """
+        source = (
+            request_data.get("litellm_metadata") or request_data.get("metadata") or {}
+        )
+        prefix = "user_api_key_"
+        result = {}
+        for key, value in source.items():
+            if not key.startswith(prefix) or value is None:
+                continue
+            try:
+                json.dumps(value)
+            except (TypeError, ValueError):
+                continue
+            result[key[len(prefix) :]] = value
+        return result
+
+    def _matches_filters(self, model: Optional[str], metadata: Dict[str, Any]) -> bool:
+        """Apply the model and key-name filters, like QuilrGuardrail.
+
+        Filters come from ``APPLY_QUILR_GUARDRAILS_FOR_MODELS`` and
+        ``APPLY_QUILR_GUARDRAILS_FOR_KEY_NAMES``. LiteLLM does not include the
+        key name in the metadata on every route (e.g. ``/v1/messages``); there,
+        a key-name filter skips the request.
+
+        Args:
+            model: Model name from the request
+            metadata: Caller details from ``_caller_metadata``
+
+        Returns:
+            True if the guardrail should run for this request
+
+        """
+        if self.allowed_models and (not model or model not in self.allowed_models):
+            return False
+
+        if self.allowed_key_names:
+            key_name = metadata.get("key_name")
+            if not key_name or key_name not in self.allowed_key_names:
+                return False
+
+        return True
