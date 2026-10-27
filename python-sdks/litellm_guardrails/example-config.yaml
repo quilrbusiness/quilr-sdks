@@ -10,4 +10,24 @@ guardrails:
       guardrail: quilr_litellm_guardrails.QuilrGuardrail
       mode: "during_call"
       default_on: true
-    
+
+  # QuilrUnifiedGuardrail checks all API formats, tool calls, MCP tools and
+  # streamed answers (see README). Example:
+  #
+  # - guardrail_name: "quilr-input"
+  #   litellm_params:
+  #     guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
+  #     mode: "pre_call"
+  #     default_on: true
+  #
+  # - guardrail_name: "quilr-output"
+  #   litellm_params:
+  #     guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
+  #     mode: "post_call"
+  #     default_on: true
+  #
+  # - guardrail_name: "quilr-mcp-output"
+  #   litellm_params:
+  #     guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
+  #     mode: "post_mcp_call"
+  #     default_on: true
