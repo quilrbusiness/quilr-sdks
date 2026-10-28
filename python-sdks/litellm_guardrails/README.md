@@ -14,6 +14,7 @@ QUILR_GUARDRAILS_KEY=sk-quilr-XXXXXXXXX
 QUILR_GUARDRAILS_BASE_URL=QUILR GUARDRAILS BASE URL
 QUILR_GUARDRAILS_TIMEOUT=3  # Optional: timeout in seconds (default: 3). If timeout or API error occurs, request passes through.
 QUILR_GUARDRAILS_FAIL_CLOSED=false  # Optional, QuilrUnifiedGuardrail only: true blocks content when Quilr can't be reached (see below)
+QUILR_GUARDRAILS_SCAN_MCP_TOOLS=all  # Optional, QuilrUnifiedGuardrail only: which MCP tools to check (see below)
 ```
 
 2. Add guardrails to your litellm `config.yaml` file. Choose the modes you need:
@@ -144,6 +145,39 @@ guardrails:
 - `pre_mcp_call` also runs when a client lists tools: one Quilr call per tool.
 - If Quilr redacts a field of a structured tool result that can't be changed (a key or a number), LiteLLM blocks the result instead.
 - The model filter (`APPLY_QUILR_GUARDRAILS_FOR_MODELS`) skips MCP checks, since LiteLLM gives MCP calls the model name `mcp-tool-call`.
+
+##### Choosing which MCP tools to check
+
+By default every MCP tool is checked. To check only some, set `QUILR_GUARDRAILS_SCAN_MCP_TOOLS` or `quilr_scan_mcp_tools` under the guardrail's `litellm_params`:
+
+| Value | Tools checked |
+|-------|---------------|
+| `all` (default, also when not set) | Every tool |
+| `none` | No MCP tools |
+| `readonly` | Tools labeled read-only (MCP `readOnlyHint: true`) |
+| `writeonly` | Tools not labeled read-only |
+| `destructive` | Tools that may delete or overwrite data (not read-only, and MCP `destructiveHint` not `false`) |
+| `run_sql,read_logs` | These tools only |
+| `writeonly,run_sql` | A mix: a tool is checked if any item matches |
+
+```yaml
+  - guardrail_name: "quilr-mcp-output"
+    litellm_params:
+      guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
+      mode: "post_mcp_call"
+      default_on: true
+      quilr_scan_mcp_tools: "writeonly,run_sql"
+```
+
+- Applies to all three MCP modes and to the tool list check.
+- Tool names can be given as the server's name (`run_sql`) or with LiteLLM's server prefix (`myserver-run_sql`). Names are case-sensitive. Label words are not, and can be written with `-` or `_` (`read-only`, `write_only`). In `config.yaml` the value can also be a YAML list.
+- A tool without labels counts as `writeonly` and `destructive` (the MCP spec's defaults), so it is still checked by those.
+- The labels are read from the MCP server's tool list and cached for 5 minutes (a failed read is retried after 30 seconds). If the list can't be read, the tool counts as unlabeled.
+- MCP servers that need each caller's own login (a per-user token; OAuth servers are expected to behave the same): the plugin can't read their tool list, so their tools count as unlabeled. `writeonly` and `destructive` then check all of them, and `readonly` checks none. Use tool names for these servers. Servers whose login is set in the LiteLLM config work normally.
+- The labels are set by the tool's own server and are not verified. Read-only tools such as SQL or log readers often return sensitive data, so skip them with care.
+- In `during_mcp_call`, LiteLLM doesn't pass the server name, so the labels are looked up on every MCP server. A tool name that exists on several servers counts as read-only only if it is read-only on all of them.
+- `none` together with other values is treated as `all`, with a warning in the log.
+- A skipped tool passes through unchanged and is logged with guardrail status `not_run`.
 
 #### Streaming responses
 
