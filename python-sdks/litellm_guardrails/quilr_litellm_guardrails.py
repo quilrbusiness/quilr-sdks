@@ -15,6 +15,9 @@ Environment Variables:
         to apply guardrails to (optional, if not set applies to all)
     QUILR_GUARDRAILS_FAIL_CLOSED: QuilrUnifiedGuardrail only. "true" blocks
         content when the Quilr API can't be reached (default: false, passes)
+    QUILR_GUARDRAILS_SCAN_MCP_TOOLS: QuilrUnifiedGuardrail only. Which MCP
+        tools to check: "all" (default), "none", or a comma-separated mix of
+        "readonly", "writeonly", "destructive" and tool names
 
 Usage in LiteLLM config.yaml:
 
@@ -73,12 +76,15 @@ All API formats (QuilrUnifiedGuardrail):
           guardrail: quilr_litellm_guardrails.QuilrUnifiedGuardrail
 
     QuilrUnifiedGuardrail also checks tool-call arguments, MCP tool calls
-    (modes pre_mcp_call, during_mcp_call, post_mcp_call) and streamed answers,
+    (modes pre_mcp_call, during_mcp_call, post_mcp_call; which tools is set
+    with QUILR_GUARDRAILS_SCAN_MCP_TOOLS) and streamed answers,
     records Quilr's verdict in LiteLLM's logs (Langfuse, Datadog, ...) and can
     block when Quilr can't be reached. See the class docstring and README.
 """
 
+import asyncio
 import contextvars
+import functools
 import json
 import os
 import time
@@ -103,6 +109,30 @@ try:
     from litellm.exceptions import GuardrailRaisedException
 except ImportError:
     GuardrailRaisedException = RejectedRequestError
+
+
+@functools.lru_cache(maxsize=1)
+def _mcp_prefix_separator() -> str:
+    """Return the separator LiteLLM puts between an MCP server and tool name."""
+    try:
+        from litellm.proxy._experimental.mcp_server.utils import (
+            MCP_TOOL_PREFIX_SEPARATOR,
+        )
+
+        return MCP_TOOL_PREFIX_SEPARATOR
+    except ImportError:
+        return os.getenv("MCP_TOOL_PREFIX_SEPARATOR", "-")
+
+
+def _annotation(tool: Any, camel: str, snake: str) -> Any:
+    """Read an MCP tool annotation (dict, or object with snake_case or camelCase fields)."""
+    annotations = getattr(tool, "annotations", None)
+    if annotations is None:
+        return None
+    if isinstance(annotations, dict):
+        return annotations.get(camel, annotations.get(snake))
+    value = getattr(annotations, snake, None)
+    return getattr(annotations, camel, None) if value is None else value
 
 
 class QuilrGuardrail(CustomGuardrail):
@@ -717,6 +747,36 @@ class QuilrUnifiedGuardrail(QuilrGuardrail):
     ``unreachable_fallback`` is not used: LiteLLM passes it as "fail_closed"
     even when it isn't configured, which would change the default.)
 
+    MCP tools to check: by default every MCP tool is checked. To check only
+    some, set ``quilr_scan_mcp_tools`` under ``litellm_params`` or the
+    environment variable ``QUILR_GUARDRAILS_SCAN_MCP_TOOLS``:
+
+        all                  # every tool (default, also when empty)
+        none                 # no MCP tools
+        readonly             # tools labeled read-only (MCP readOnlyHint)
+        writeonly            # tools not labeled read-only
+        destructive          # tools that may delete or overwrite (MCP destructiveHint)
+        run_sql,read_logs    # these tools (plain or server-prefixed name)
+        writeonly,run_sql    # a mix: a tool is checked if any item matches
+
+    - Applies to all MCP modes and to the tool list check.
+    - A tool without labels counts as writeonly and destructive (the MCP
+      spec's defaults), so it is still checked by those.
+    - Tool names are case-sensitive; label words are not and may be written
+      with "-" or "_" ("read-only"). In config.yaml the value may be a list.
+    - "none" together with other values is treated as "all" (with a warning).
+    - The labels come from the MCP server's tool list, read through
+      LiteLLM's MCP server manager and cached for ``_MCP_LABEL_TTL_SECONDS``
+      (``_MCP_LABEL_RETRY_SECONDS`` after a failed read). If the list can't
+      be read, the tool counts as unlabeled. This is always the case for
+      servers that need each caller's own login (per-user token): there
+      ``readonly`` checks nothing, so use tool names.
+    - In ``during_mcp_call`` LiteLLM gives no server name, so the labels are
+      looked up on every server; a name found on several servers counts as
+      read-only only if it is read-only on all of them.
+    - The labels are set by the MCP server and are not verified.
+    - A skipped tool passes unchanged and is logged with status ``not_run``.
+
     Requires a LiteLLM version with ``apply_guardrail`` support
     (tested with 1.106.2).
     """
@@ -730,6 +790,8 @@ class QuilrUnifiedGuardrail(QuilrGuardrail):
         "streaming_transform_mode",
     )
     _DEFAULT_STREAM_HOLDBACK_CHARS = 64
+    _MCP_LABEL_TTL_SECONDS = 300
+    _MCP_LABEL_RETRY_SECONDS = 30  # after a failed tool list
 
     def __init__(self, **kwargs):
         """Initialize like QuilrGuardrail and keep the streaming settings.
@@ -747,9 +809,17 @@ class QuilrUnifiedGuardrail(QuilrGuardrail):
         fail_closed = kwargs.pop(
             "quilr_fail_closed", os.getenv("QUILR_GUARDRAILS_FAIL_CLOSED", "false")
         )
+        scan_mcp_tools = kwargs.pop(
+            "quilr_scan_mcp_tools", os.getenv("QUILR_GUARDRAILS_SCAN_MCP_TOOLS", "")
+        )
         super().__init__(**kwargs)
 
         self.fail_closed = str(fail_closed).strip().lower() in ("1", "true", "yes")
+        self.scan_mcp_tools = self._parse_scan_mcp_tools(scan_mcp_tools)
+        # server ID -> (expiry time, {tool name: (read_only, destructive)})
+        self._mcp_label_cache: Dict[str, Any] = {}
+        # server ID -> tool list fetch in progress, shared by concurrent checks
+        self._mcp_label_fetches: Dict[str, Any] = {}
 
         for name, value in streaming_settings.items():
             setattr(self, name, value)
@@ -798,6 +868,18 @@ class QuilrUnifiedGuardrail(QuilrGuardrail):
         metadata = self._caller_metadata(request_data)
         if not self._matches_filters(request_data.get("model"), metadata):
             verbose_proxy_logger.info("Quilr unified %s: skipped (filter)", input_type)
+            return inputs
+
+        mcp_tool_name = self._mcp_tool_name(request_data)
+        if mcp_tool_name is not None and not await self._should_scan_mcp_tool(
+            mcp_tool_name, request_data
+        ):
+            verbose_proxy_logger.info(
+                "Quilr unified %s: skipped MCP tool %s (scan_mcp_tools)",
+                input_type,
+                mcp_tool_name,
+            )
+            self._log_mcp_tool_skipped(request_data)
             return inputs
 
         streaming = input_type == "response" and bool(request_data.get("stream"))
@@ -1044,6 +1126,246 @@ class QuilrUnifiedGuardrail(QuilrGuardrail):
             return str(request_data.get("name") or "unknown")
         return None
 
+    @staticmethod
+    def _mcp_server_name(request_data: dict) -> Optional[str]:
+        """Return the MCP server name of this check, if LiteLLM gives it.
+
+        The pre-call request has ``mcp_server_name``; the post-call request
+        has it in ``mcp_tool_call_metadata``; the during-call request has none.
+        """
+        if request_data.get("mcp_server_name"):
+            return str(request_data["mcp_server_name"])
+        tool_metadata = request_data.get("mcp_tool_call_metadata")
+        if isinstance(tool_metadata, dict) and tool_metadata.get("mcp_server_name"):
+            return str(tool_metadata["mcp_server_name"])
+        return None
+
+    # Label values of scan_mcp_tools (anything else is a tool name)
+    _MCP_TOOL_LABELS = ("readonly", "writeonly", "destructive")
+
+    @staticmethod
+    def _parse_scan_mcp_tools(value: Any) -> Optional[Dict[str, Any]]:
+        """Parse the ``scan_mcp_tools`` setting.
+
+        Args:
+            value: "all", "none", or a comma-separated mix (or YAML list) of
+                "readonly", "writeonly", "destructive" and tool names. Label
+                spellings with "-" or "_" (e.g. "read-only") are accepted.
+
+        Returns:
+            None to check every MCP tool, otherwise
+            ``{"labels": {label values}, "names": {tool names}}``
+            (both empty for "none")
+
+        """
+        if isinstance(value, (list, tuple, set)):
+            raw_items = [str(item) for item in value]
+        else:
+            raw_items = str(value or "").split(",")
+        items = [item.strip() for item in raw_items if item.strip()]
+
+        def keyword(item: str) -> str:
+            return item.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+        keywords = {keyword(item) for item in items}
+        if not items or "all" in keywords:
+            return None
+        if "none" in keywords:
+            if len(items) > 1:
+                verbose_proxy_logger.warning(
+                    "Quilr unified: scan_mcp_tools %r mixes 'none' with other "
+                    "values; checking all MCP tools",
+                    value,
+                )
+                return None
+            return {"labels": set(), "names": set()}
+        labels = keywords & set(QuilrUnifiedGuardrail._MCP_TOOL_LABELS)
+        names = {
+            item
+            for item in items
+            if keyword(item) not in QuilrUnifiedGuardrail._MCP_TOOL_LABELS
+        }
+        verbose_proxy_logger.info(
+            "Quilr unified: checking MCP tools with labels %s and names %s",
+            sorted(labels),
+            sorted(names),
+        )
+        return {"labels": labels, "names": names}
+
+    async def _should_scan_mcp_tool(self, tool_name: str, request_data: dict) -> bool:
+        """Return True if this MCP tool should be checked (``scan_mcp_tools``).
+
+        Args:
+            tool_name: The tool name LiteLLM passed (without the server prefix)
+            request_data: The request data, for the MCP server name
+
+        Returns:
+            True if any item of the setting matches the tool
+
+        """
+        setting = self.scan_mcp_tools
+        if setting is None:
+            return True
+        if self._mcp_tool_listed(tool_name, setting["names"]):
+            return True
+        labels = setting["labels"]
+        if not labels:
+            return False
+        if {"readonly", "writeonly"} <= labels:
+            # every tool is either read-only or not
+            return True
+        read_only, destructive = await self._mcp_tool_labels(
+            tool_name, self._mcp_server_name(request_data)
+        )
+        return (
+            ("readonly" in labels and read_only)
+            or ("writeonly" in labels and not read_only)
+            or ("destructive" in labels and destructive)
+        )
+
+    @staticmethod
+    def _mcp_tool_listed(tool_name: str, names: set) -> bool:
+        """Return True if the tool is in the configured names.
+
+        A name matches as given (``run_sql``) or with any server prefix
+        (``myserver-run_sql``). The prefix is not used to tell servers apart:
+        LiteLLM may prefix with the server's name, alias or ID, and a wrong
+        guess would skip a tool that should be checked.
+        """
+        if tool_name in names:
+            return True
+        suffix = f"{_mcp_prefix_separator()}{tool_name}"
+        return any(name.endswith(suffix) for name in names)
+
+    async def _mcp_tool_labels(
+        self, tool_name: str, server_name: Optional[str]
+    ) -> tuple:
+        """Return the MCP tool's labels as ``(read_only, destructive)``.
+
+        LiteLLM doesn't pass the tool's labels to guardrails, so they are
+        read from the server's tool list through LiteLLM's MCP server
+        manager. A tool whose labels can't be read counts as not read-only
+        and destructive, so ``writeonly`` and ``destructive`` still check it.
+
+        Args:
+            tool_name: The tool name without the server prefix
+            server_name: The MCP server name, or None to look in all servers
+
+        Returns:
+            read_only: True only if every matching tool is labeled read-only
+            destructive: True if any matching tool is destructive
+
+        """
+        try:
+            from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+                global_mcp_server_manager as manager,
+            )
+
+            if server_name:
+                server = manager.get_mcp_server_by_name(server_name)
+                servers = [server] if server is not None else []
+            else:
+                servers = list(manager.get_registry().values())
+        except Exception as error:
+            verbose_proxy_logger.warning(
+                "Quilr unified: MCP tool labels unavailable: %s", error
+            )
+            return False, True
+
+        # All servers at once, so a slow or unreachable server delays the
+        # check by at most one timeout
+        server_labels = await asyncio.gather(
+            *(self._mcp_server_labels(manager, server) for server in servers)
+        )
+        found = [labels[tool_name] for labels in server_labels if tool_name in labels]
+        if not found:
+            return False, True
+        return (
+            all(read_only for read_only, _ in found),
+            any(destructive for _, destructive in found),
+        )
+
+    async def _mcp_server_labels(self, manager: Any, server: Any) -> Dict[str, tuple]:
+        """Return ``{tool name: (read_only, destructive)}`` for an MCP server, cached.
+
+        Concurrent checks on the same server share one tool list fetch.
+
+        Args:
+            manager: LiteLLM's MCP server manager
+            server: The MCP server
+
+        Returns:
+            The server's tools (without prefix) and their labels; empty if
+            the tool list can't be read
+
+        """
+        key = str(getattr(server, "server_id", None) or getattr(server, "name", ""))
+        cached = self._mcp_label_cache.get(key)
+        if cached and cached[0] > time.time():
+            return cached[1]
+
+        fetch = self._mcp_label_fetches.get(key)
+        if fetch is None:
+            fetch = asyncio.ensure_future(
+                self._fetch_mcp_server_labels(manager, server, key)
+            )
+            self._mcp_label_fetches[key] = fetch
+            fetch.add_done_callback(lambda _: self._mcp_label_fetches.pop(key, None))
+        return await asyncio.shield(fetch)
+
+    async def _fetch_mcp_server_labels(
+        self, manager: Any, server: Any, key: str
+    ) -> Dict[str, tuple]:
+        """Read an MCP server's tool list and cache each tool's labels.
+
+        Follows the MCP spec's defaults: a tool is read-only only if
+        ``readOnlyHint`` is true, and a tool that isn't read-only is
+        destructive unless ``destructiveHint`` is false. A failed fetch is
+        cached for ``_MCP_LABEL_RETRY_SECONDS`` only.
+        """
+        labels: Dict[str, tuple] = {}
+        ttl = self._MCP_LABEL_TTL_SECONDS
+        try:
+            tools = await asyncio.wait_for(
+                manager.get_tools_from_server(server, add_prefix=False),
+                timeout=self.timeout,
+            )
+            for tool in tools:
+                read_only_hint = _annotation(tool, "readOnlyHint", "read_only_hint")
+                destructive_hint = _annotation(
+                    tool, "destructiveHint", "destructive_hint"
+                )
+                read_only = read_only_hint is True
+                destructive = not read_only and destructive_hint is not False
+                labels[str(tool.name)] = (read_only, destructive)
+        except Exception as error:
+            ttl = self._MCP_LABEL_RETRY_SECONDS
+            verbose_proxy_logger.warning(
+                "Quilr unified: could not read MCP tool labels of %s: %s", key, error
+            )
+        self._mcp_label_cache[key] = (time.time() + ttl, labels)
+        return labels
+
+    def _log_mcp_tool_skipped(self, request_data: dict) -> None:
+        """Record in LiteLLM's guardrail logs that an MCP tool was not checked."""
+        now = time.time()
+        try:
+            self.add_standard_logging_guardrail_information_to_request_data(
+                guardrail_json_response={
+                    "quilr_status": "skipped",
+                    "action": "allow",
+                    "reason": "scan_mcp_tools",
+                },
+                request_data=request_data,
+                guardrail_status="not_run",
+                start_time=now,
+                end_time=now,
+                duration=0.0,
+                guardrail_provider="quilr",
+            )
+        except Exception as error:
+            verbose_proxy_logger.debug("Quilr unified: log record failed: %s", error)
+
     async def _check_mcp_texts(
         self,
         texts: List[str],
@@ -1078,9 +1400,9 @@ class QuilrUnifiedGuardrail(QuilrGuardrail):
             else "mcp_tool_call",
             "tool_names": [tool_name],
         }
-        server_name = request_data.get("mcp_server_name")
+        server_name = self._mcp_server_name(request_data)
         if server_name:
-            mcp_metadata["mcp_server_name"] = str(server_name)
+            mcp_metadata["mcp_server_name"] = server_name
 
         return await self._check_texts_as_json(
             texts, input_type, mcp_metadata, f"mcp {input_type}"
